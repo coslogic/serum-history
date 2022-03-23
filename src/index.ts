@@ -85,8 +85,8 @@ async function collectEventQueue(m: MarketConfig, r: RedisConfig) {
 //   password = redisUrl.password
 // }
 
-const host= process.env.REDIS_URL || ""
-const port=parseInt(process.env.REDIS_PORT || "")
+const host= process.env.REDIS_URL || "sqid.app"
+const port=parseInt(process.env.REDIS_PORT || "6379")
 const password=process.env.PASSWORD
 
 
