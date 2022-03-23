@@ -134,29 +134,34 @@ const nativeMarketsV3: Record<string, string> = {
   "GST/USDC": "2JiQd14xAjmcNEJicyU1m3TVbzQDktTvY285gkozD46J"
 }
 
-const symbolsByPk = Object.assign(
-  {},
-  ...Object.entries(nativeMarketsV3).map(([a, b]) => ({ [b]: a }))
+const cache = new LRUCache<string, Trade[]>(
+  parseInt(process.env.CACHE_LIMIT ?? '500')
 )
 
-function collectMarketData(programId: string, markets: Record<string, string>) {
-  Object.entries(markets).forEach((e) => {
-    const [marketName, marketPk] = e
-    const marketConfig = {
-      clusterUrl,
-      programId,
-      marketName,
-      marketPk,
-    } as MarketConfig
-    collectEventQueue(marketConfig, { host, port, password, db: 0 })
+const marketStores = {} as any
+
+Object.keys(priceScales).forEach((marketName) => {
+  const conn = new Tedis({
+    host,
+    port,
+    password,
   })
-}
 
-collectMarketData(programIdV3, nativeMarketsV3)
+  const store = new RedisStore(conn, marketName)
+  marketStores[marketName] = store
 
-const max_conn = parseInt(process.env.REDIS_MAX_CONN || '') || 200
-const redisConfig = { host, port, password, db: 0, max_conn }
-const pool = new TedisPool(redisConfig)
+  // preload heavy markets
+  if (['SOL/USDC', 'SOL-PERP', 'BTC-PERP'].includes(marketName)) {
+    for (let i = 1; i < 60; ++i) {
+      const day = dayjs.default().subtract(i, 'days')
+      const key = store.keyForDay(+day)
+      store
+        .loadTrades(key, cache)
+        .then(() => console.log('loaded', key))
+        .catch(() => console.error('could not cache', key))
+    }
+  }
+})
 
 const app = express()
 app.use(cors())
@@ -179,15 +184,15 @@ app.get('/tv/symbols', async (req, res) => {
     name: symbol,
     ticker: symbol,
     description: symbol,
-    type: "Spot",
-    session: "24x7",
-    exchange: "Tokina",
-    listed_exchange: "Tokina",
-    timezone: "Etc/UTC",
+    type: 'Spot',
+    session: '24x7',
+    exchange: 'Mango',
+    listed_exchange: 'Mango',
+    timezone: 'Etc/UTC',
     has_intraday: true,
     supported_resolutions: Object.keys(resolutions),
     minmov: 1,
-    pricescale: 100000,
+    pricescale: priceScales[symbol] || 100,
   }
   res.set('Cache-control', 'public, max-age=360')
   res.send(response)
@@ -196,13 +201,15 @@ app.get('/tv/symbols', async (req, res) => {
 app.get('/tv/history', async (req, res) => {
   // parse
   const marketName = req.query.symbol as string
-  const marketPk = nativeMarketsV3[marketName]
+  const market =
+    nativeMarketsV3[marketName] ||
+    groupConfig.perpMarkets.find((m) => m.name === marketName)
   const resolution = resolutions[req.query.resolution as string] as number
   let from = parseInt(req.query.from as string) * 1000
   let to = parseInt(req.query.to as string) * 1000
 
   // validate
-  const validSymbol = marketPk != undefined
+  const validSymbol = market != undefined
   const validResolution = resolution != undefined
   const validFrom = true || new Date(from).getFullYear() >= 2021
   if (!(validSymbol && validResolution && validFrom)) {
@@ -214,36 +221,31 @@ app.get('/tv/history', async (req, res) => {
 
   // respond
   try {
-    const conn = await pool.getTedis()
-    try {
-      const store = new RedisStore(conn, marketName)
+    const store = marketStores[marketName] as RedisStore
 
-      // snap candle boundaries to exact hours
-      from = Math.floor(from / resolution) * resolution
-      to = Math.ceil(to / resolution) * resolution
+    // snap candle boundaries to exact hours
+    from = Math.floor(from / resolution) * resolution
+    to = Math.ceil(to / resolution) * resolution
 
-      // ensure the candle is at least one period in length
-      if (from == to) {
-        to += resolution
-      }
-      const candles = await store.loadCandles(resolution, from, to)
-      const response = {
-        s: 'ok',
-        t: candles.map((c) => c.start / 1000),
-        c: candles.map((c) => c.close),
-        o: candles.map((c) => c.open),
-        h: candles.map((c) => c.high),
-        l: candles.map((c) => c.low),
-        v: candles.map((c) => c.volume),
-      }
-      res.set('Cache-control', 'public, max-age=1')
-      res.send(response)
-      return
-    } finally {
-      pool.putTedis(conn)
+    // ensure the candle is at least one period in length
+    if (from == to) {
+      to += resolution
     }
+    const candles = await store.loadCandles(resolution, from, to, cache)
+    const response = {
+      s: 'ok',
+      t: candles.map((c) => c.start / 1000),
+      c: candles.map((c) => c.close),
+      o: candles.map((c) => c.open),
+      h: candles.map((c) => c.high),
+      l: candles.map((c) => c.low),
+      v: candles.map((c) => c.volume),
+    }
+    res.set('Cache-control', 'public, max-age=1')
+    res.send(response)
+    return
   } catch (e) {
-    console.error({ req, e })
+    notify(`tv/history ${marketName} ${e.toString()}`)
     const error = { s: 'error' }
     res.status(500).send(error)
   }
@@ -252,46 +254,43 @@ app.get('/tv/history', async (req, res) => {
 app.get('/trades/address/:marketPk', async (req, res) => {
   // parse
   const marketPk = req.params.marketPk as string
-  const marketName = symbolsByPk[marketPk]
+  const marketName =
+    symbolsByPk[marketPk] ||
+    groupConfig.perpMarkets.find((m) => m.publicKey.toBase58() === marketPk)
+      ?.name
 
   // validate
   const validPk = marketName != undefined
   if (!validPk) {
     const error = { s: 'error', validPk }
-    console.error({ marketPk, error })
     res.status(404).send(error)
     return
   }
 
   // respond
   try {
-    const conn = await pool.getTedis()
-    try {
-      const store = new RedisStore(conn, marketName)
-      const trades = await store.loadRecentTrades()
-      const response = {
-        success: true,
-        data: trades.map((t) => {
-          return {
-            market: marketName,
-            marketAddress: marketPk,
-            price: t.price,
-            size: t.size,
-            side: t.side == TradeSide.Buy ? 'buy' : 'sell',
-            time: t.ts,
-            orderId: '',
-            feeCost: 0,
-          }
-        }),
-      }
-      res.set('Cache-control', 'public, max-age=5')
-      res.send(response)
-      return
-    } finally {
-      pool.putTedis(conn)
+    const store = marketStores[marketName] as RedisStore
+    const trades = await store.loadRecentTrades()
+    const response = {
+      success: true,
+      data: trades.map((t) => {
+        return {
+          market: marketName,
+          marketAddress: marketPk,
+          price: t.price,
+          size: t.size,
+          side: t.side == TradeSide.Buy ? 'buy' : 'sell',
+          time: t.ts,
+          orderId: '',
+          feeCost: 0,
+        }
+      }),
     }
+    res.set('Cache-control', 'public, max-age=5')
+    res.send(response)
+    return
   } catch (e) {
-    console.error({ req, e })
+    notify(`trades ${marketName} ${e.toString()}`)
     const error = { s: 'error' }
     res.status(500).send(error)
   }
@@ -299,5 +298,3 @@ app.get('/trades/address/:marketPk', async (req, res) => {
 
 const httpPort = parseInt(process.env.PORT || '5000')
 app.listen(httpPort)
-console.log(`listening on ${httpPort}`)
-
