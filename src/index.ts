@@ -1,5 +1,4 @@
-require('dotenv').config()
-import { Account, Connection, PublicKey } from '@solana/web3.js'
+import { Account, Commitment, Connection, PublicKey } from '@solana/web3.js'
 import { Market } from '@project-serum/serum'
 import cors from 'cors'
 import express from 'express'
@@ -9,92 +8,34 @@ import { decodeRecentEvents } from './events'
 import { MarketConfig, Trade, TradeSide } from './interfaces'
 import { RedisConfig, RedisStore, createRedisStore } from './redis'
 import { resolutions, sleep } from './time'
+import {
+  Config,
+  getMarketByBaseSymbolAndKind,
+  GroupConfig,
+  MangoClient,
+  PerpMarketConfig,
+  FillEvent,
+} from '@blockworks-foundation/mango-client'
+import BN from 'bn.js'
+import notify from './notify'
+import LRUCache from 'lru-cache'
+import * as dayjs from 'dayjs'
 
-async function collectEventQueue(m: MarketConfig, r: RedisConfig) {
-  const store = await createRedisStore(r, m.marketName)
-  const marketAddress = new PublicKey(m.marketPk)
-  const programKey = new PublicKey(m.programId)
-  const connection = new Connection(m.clusterUrl)
-  const market = await Market.load(
-    connection,
-    marketAddress,
-    undefined,
-    programKey
-  )
-
-  async function fetchTrades(lastSeqNum?: number): Promise<[Trade[], number]> {
-    const now = Date.now()
-    const accountInfo = await connection.getAccountInfo(
-      market['_decoded'].eventQueue
-    )
-    if (accountInfo === null) {
-      throw new Error(
-        `Event queue account for market ${m.marketName} not found`
-      )
-    }
-    const { header, events } = decodeRecentEvents(accountInfo.data, lastSeqNum)
-    const takerFills = events.filter(
-      (e) => e.eventFlags.fill && !e.eventFlags.maker
-    )
-    const trades = takerFills
-      .map((e) => market.parseFillEvent(e))
-      .map((e) => {
-        return {
-          price: e.price,
-          side: e.side === 'buy' ? TradeSide.Buy : TradeSide.Sell,
-          size: e.size,
-          ts: now,
-        }
-      })
-    /*
-    if (trades.length > 0)
-      console.log({e: events.map(e => e.eventFlags), takerFills, trades})
-    */
-    return [trades, header.seqNum]
-  }
-
-  async function storeTrades(ts: Trade[]) {
-    if (ts.length > 0) {
-      console.log(m.marketName, ts.length)
-      for (let i = 0; i < ts.length; i += 1) {
-        await store.storeTrade(ts[i])
-      }
-    }
-  }
-
-  while (true) {
-    try {
-      const lastSeqNum = await store.loadNumber('LASTSEQ')
-      const [trades, currentSeqNum] = await fetchTrades(lastSeqNum)
-      storeTrades(trades)
-      store.storeNumber('LASTSEQ', currentSeqNum)
-    } catch (err) {
-      console.error(m.marketName, err.toString())
-    }
-    await sleep({
-      Seconds: process.env.INTERVAL ? parseInt(process.env.INTERVAL) : 2,
-    })
-  }
+const redisUrl = new URL(process.env.REDISCLOUD_URL || 'redis://localhost:6379')
+const host = redisUrl.hostname
+const port = parseInt(redisUrl.port)
+let password: string | undefined
+if (redisUrl.password !== '') {
+  password = redisUrl.password
 }
-
-// const redisUrl = new URL(process.env.REDIS_URL || "redis://localhost:6379")
-// const host = redisUrl.hostname
-// const port = parseInt(redisUrl.port)
-// let password: string | undefined
-// if (redisUrl.password !== "") {
-//   password = redisUrl.password
-// }
-
-const host= process.env.REDIS_URL || "redis://sqid.herokuapp.com:6379"
-const port=parseInt(process.env.REDIS_PORT || "6379"
-const password=process.env.PASSWORD
-
-
 
 const network = 'mainnet-beta'
 const clusterUrl =
- // process.env.RPC_ENDPOINT_URL || 'https://solana-api.projectserum.com'
- process.env.RPC_ENDPOINT_URL || 'https://solana-api.tt-prod.net'
+  process.env.RPC_ENDPOINT_URL || 'https://solana-api.projectserum.com'
+const fetchInterval = process.env.INTERVAL ? parseInt(process.env.INTERVAL) : 30
+
+console.log({ clusterUrl, fetchInterval })
+
 const programIdV3 = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin'
 
 const nativeMarketsV3: Record<string, string> = {
