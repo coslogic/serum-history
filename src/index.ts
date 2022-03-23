@@ -154,7 +154,7 @@ function collectMarketData(programId: string, markets: Record<string, string>) {
 
 collectMarketData(programIdV3, nativeMarketsV3)
 
-const max_conn = parseInt(process.env.REDIS_MAX_CONN || '') || 500
+const max_conn = parseInt(process.env.REDIS_MAX_CONN || '') || 200
 const redisConfig = { host, port, password, db: 0, max_conn }
 const pool = new TedisPool(redisConfig)
 
