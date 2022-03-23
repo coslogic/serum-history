@@ -86,7 +86,7 @@ async function collectEventQueue(m: MarketConfig, r: RedisConfig) {
 // }
 
 const host= process.env.REDIS_URL || "redis://sqid.herokuapp.com:6379"
-const port=parseInt(process.env.REDIS_PORT || "6379")
+const port=parseInt(process.env.REDIS_PORT || "6379"
 const password=process.env.PASSWORD
 
 
